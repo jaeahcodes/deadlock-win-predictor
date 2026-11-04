@@ -161,5 +161,3 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
 if __name__ == "__main__":
     for idx in len(SLICES):
         extract_match_player_salts_data(SLICES[idx])
-
-
