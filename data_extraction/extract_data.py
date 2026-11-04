@@ -10,7 +10,8 @@ This script executes in the following order:
 """
 
 # 1. Initialize paths and logging
-base_dir = Path().resolve().parent if Path().resolve().name == "notebooks" else Path.resolve()
+script_dir = Path(__file__).resolve().parent
+base_dir = script_dir.parent.parent if script_dir.parent.name == "data_extraction" else script_dir.parent
 data_dir = base_dir / "data"
 
 db_path = str(data_dir / "deadlock.duckdb")
@@ -45,7 +46,7 @@ def get_file_slice(table: str, start_idx: int, end_idx: int) -> list[str]:
                  if t["policy"] == "snapshot" or f.get("generation", 0) == gen]
     return file_list[start_idx : end_idx]
 
-SLICES = [(0, 15), (15, 20), (20, 25)]
+SLICES = [(0, 15), (15, 22)]
 TARGET_TABLES = ["match_salts", "match_player"]
 
 def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TABLES):
@@ -159,5 +160,5 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
     log_message("Extraction Run Finished Successfully")
 
 if __name__ == "__main__":
-    for idx in len(SLICES):
+    for idx in range(len(SLICES)):
         extract_match_player_salts_data(SLICES[idx])
