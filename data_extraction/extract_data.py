@@ -46,7 +46,7 @@ def get_file_slice(table: str, start_idx: int, end_idx: int) -> list[str]:
                  if t["policy"] == "snapshot" or f.get("generation", 0) == gen]
     return file_list[start_idx : end_idx]
 
-SLICES = [(0, 15), (15, 22)]
+SLICES = [(0, 15), (15, 23)]
 TARGET_TABLES = ["match_salts", "match_player"]
 
 def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TABLES):
