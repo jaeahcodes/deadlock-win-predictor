@@ -6,6 +6,8 @@ import sys
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 """
 This script executes in the following order:
 (1) Creates a "data" folder if it doesn't already exist, and initializes a .duckdb file. Initializes an extraction log .txt file.
@@ -30,8 +32,6 @@ def log_message(message: str):
     with open(log_path, "a", encoding = "utf-8") as f:
         f.write(formatted_msg + "\n")
 
-log_message(f"Starting Match Player Salts Data Extraction Run")
-
 # 2. Connect  to DuckDB
 con = duckdb.connect(db_path)
 con.execute("SET threads = 1;")
@@ -54,6 +54,7 @@ SLICES = [(0, 15), (15, 23)]
 TARGET_TABLES = ["match_salts", "match_player"]
 
 def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TABLES):
+    log_message(f"Starting Match Player Salts Data Extraction Run")
     start_no, end_no = idx_slice
 
     for name in target_tables:
@@ -170,6 +171,8 @@ match_id_query = """
 MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 
 async def fetch_metadata_async(batch_size: int = 5000):
+    con.execute("CREATE TABLE IF NOT EXISTS match_metadata AS SELECT * FROM (SELECT 1 AS dummy) WHERE 1=0;")
+
     try:
         fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_metadata").fetchall())
     except Exception:
@@ -199,14 +202,17 @@ async def fetch_metadata_async(batch_size: int = 5000):
             return None
 
     async with httpx.AsyncClient() as client:
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            log_message(f"Processing batch {chunk_idx}/{len(chunks)} ({len(chunk)} matches)...")
-            tasks = [fetch_one(client, mid) for mid in chunk]
-            results = await asyncio.gather(*tasks)
+        with tqdm(chunks, desc = "Overall Batches", unit = "batch") as batch_bar:
+            for chunk_idx, chunk in enumerate(batch_bar, 1):
+                tasks = [fetch_one(client, mid) for mid in chunk]
+                results = await tqdm.asyncio.gather(*tasks)
 
             valid = [r for r in results if r is not None]
             if valid:
                 df = pd.DataFrame(valid)
+                if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values():
+                    con.execute("DROP TABLE match_metadata;")
+                    con.execute("CREATE TABLE match_metadata AS SELECT * FROM df WHERE 1=0;")
                 con.append("match_metadata", df)
                 log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
             else: 
