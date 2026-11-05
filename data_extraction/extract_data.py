@@ -169,7 +169,7 @@ match_id_query = """
 """
 MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 
-async def fetch_metadata_async():
+async def fetch_metadata_async(batch_size: int = 5000):
     try:
         fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_metadata").fetchall())
     except Exception:
@@ -183,6 +183,8 @@ async def fetch_metadata_async():
         log_message("Metadata is fully up to date.")
         return
 
+    chunks = [pending_match_ids[i : i + batch_size] for i in range(0, len(pending_match_ids), batch_size)]
+    log_message(f"Split {len(pending_match_ids)} pending matches into {len(chunks)} batches of up to {batch_size}")
     semaphore = asyncio.Semaphore(15)
 
     async def fetch_one(client, mid):
@@ -197,14 +199,19 @@ async def fetch_metadata_async():
             return None
 
     async with httpx.AsyncClient() as client:
-        tasks = [fetch_one(client, mid) for mid in pending_match_ids]
-        results = await asyncio.gather(*tasks)
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            log_message(f"Processing batch {chunk_idx}/{len(chunks)} ({len(chunk)} matches)...")
+            tasks = [fetch_one(client, mid) for mid in chunk]
+            results = await asyncio.gather(*tasks)
 
-    valid = [r for r in results if r is not None]
-    if valid:
-        df = pd.DataFrame(valid)
-        con.append("match_metadata", df)
-        log_message(f"Successfully inserted {len(valid)} metadata records.")
+            valid = [r for r in results if r is not None]
+            if valid:
+                df = pd.DataFrame(valid)
+                con.append("match_metadata", df)
+                log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
+            else: 
+                log_message(f"Batch {chunk_idx} warning: No valid metadata returned for this chunk.")
+            await asyncio.sleep(1.0)
 
     log_message("Metadata Ingestion Complete.")
 
