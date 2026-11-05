@@ -1,5 +1,9 @@
 import duckdb
 import requests
+import asyncio
+import httpx
+import sys
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
 """
@@ -26,7 +30,7 @@ def log_message(message: str):
     with open(log_path, "a", encoding = "utf-8") as f:
         f.write(formatted_msg + "\n")
 
-log_message(f"Starting Extraction Run | DB Path: {db_path}")
+log_message(f"Starting Match Player Salts Data Extraction Run")
 
 # 2. Connect  to DuckDB
 con = duckdb.connect(db_path)
@@ -159,6 +163,71 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
 
     log_message("Extraction Run Finished Successfully")
 
+match_id_query = """
+    SELECT DISTINCT match_id
+    FROM player_features
+"""
+MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
+
+async def fetch_metadata_async():
+    try:
+        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_metadata").fetchall())
+    except Exception:
+        fetched_ids = set()
+
+    pending_match_ids = [mid for mid in MATCH_ID_LIST if mid not in fetched_ids]
+
+    log_message(f"Total matches: {len(MATCH_ID_LIST)} | Already fetched: {len(fetched_ids)}")
+
+    if not pending_match_ids:
+        log_message("Metadata is fully up to date.")
+        return
+
+    semaphore = asyncio.Semaphore(15)
+
+    async def fetch_one(client, mid):
+        url = f"https://api.deadlock-api.com/v1/matches/{mid}/metadata"
+        async with semaphore:
+            try:
+                res = await client.get(url, timeout = 15.0)
+                if res.status_code == 200:
+                    return res.json()
+            except Exception:
+                pass
+            return None
+
+    async with httpx.AsyncClient() as client:
+        tasks = [fetch_one(client, mid) for mid in pending_match_ids]
+        results = await asyncio.gather(*tasks)
+
+    valid = [r for r in results if r is not None]
+    if valid:
+        df = pd.DataFrame(valid)
+        con.append("match_metadata", df)
+        log_message(f"Successfully inserted {len(valid)} metadata records.")
+
+    log_message("Metadata Ingestion Complete.")
+
+def main_menu():
+    while True:
+        print("\n=================================")
+        print("    DEADLOCK PIPELINE MANAGER    ")
+        print("=================================")
+        print("1. Extract Match Player & Salts Data (Parquet)")
+        print("2. Extract Match Metadata (Async API)")
+        print("3. Exit")
+        choice = input("\nEnter your choice (1-3): ").strip()
+
+        if choice == '1': 
+            extract_match_player_salts_data_wrapper = getattr(sys.modules[__name__], 'extract_match_player_salts_data')
+            extract_match_player_salts_data_wrapper()
+        elif choice == '2':
+            asyncio.run(fetch_metadata_async())
+        elif choice == '3':
+            print("Exiting pipeline.")
+            break
+        else: 
+            print("Invalid choice. Please enter 1, 2, or 3.")
+
 if __name__ == "__main__":
-    for idx in range(len(SLICES)):
-        extract_match_player_salts_data(SLICES[idx])
+    main_menu()
