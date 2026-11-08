@@ -64,8 +64,8 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
                 log_message(f"No more files available for {name} at index {start_no}. Skipping this table.")
                 continue
 
-            log_message(f"Creating view for {name} using files {start_no} to {end_no}...")
-            con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
+            log_message(f"Creating table for {name} using files {start_no} to {end_no}...")
+            con.execute(f"CREATE OR REPLACE {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
 
     log_message("Phase 1: Extracting and inserting player features into persistent table")
     con.execute("""
@@ -173,8 +173,25 @@ MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 async def fetch_metadata_async(batch_size: int = 5000):
     con.execute("CREATE TABLE IF NOT EXISTS match_metadata AS SELECT * FROM (SELECT 1 AS dummy) WHERE 1=0;")
 
+    log_message("Deduplicating match_metadata...")
+
+    dedup_query = """
+        CREATE OR REPLACE TABLE match_metadata AS
+        SELECT * EXCLUDE (row_num)
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY m.match_info.match_id) AS row_num
+            FROM match_metadata m
+        )
+        WHERE row_num = 1;
+    """
+    con.execute(dedup_query)
+    total_rows = con.execute("SELECT COUNT(*) FROM match_metadata;").fetchone()[0]
+    unique_rows = con.execute("SELECT COUNT(DISTINCT m.match_info.match_id) FROM match_metadata m;")
+    log_message(f"match_metadata deduplication complete\nTotal Rows: {total_rows:,} | Unique Rows: {unique_rows:,}")
+
     try:
-        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_metadata").fetchall())
+        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
     except Exception:
         fetched_ids = set()
 
@@ -210,10 +227,12 @@ async def fetch_metadata_async(batch_size: int = 5000):
                 valid = [r for r in results if r is not None]
                 if valid:
                     df = pd.DataFrame(valid)
+                    con.register('temp_df', df)
                     if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values:
                         con.execute("DROP TABLE match_metadata;")
-                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM df WHERE 1=0;")
-                    con.append("match_metadata", df)
+                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df WHERE 1=0;")
+                    con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                    con.unregister('temp_df')
                     batch_bar.set_postfix(inserted = len(valid))
                     log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
                 else: 
