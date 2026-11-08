@@ -205,19 +205,21 @@ async def fetch_metadata_async(batch_size: int = 5000):
         with tqdm(chunks, desc = "Overall Batches", unit = "batch") as batch_bar:
             for chunk_idx, chunk in enumerate(batch_bar, 1):
                 tasks = [fetch_one(client, mid) for mid in chunk]
-                results = await tqdm.asyncio.gather(*tasks)
+                results = await tqdm_asyncio.gather(*tasks, desc = f"Batch {chunk_idx} Requests", leave = False)
 
-            valid = [r for r in results if r is not None]
-            if valid:
-                df = pd.DataFrame(valid)
-                if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values():
-                    con.execute("DROP TABLE match_metadata;")
-                    con.execute("CREATE TABLE match_metadata AS SELECT * FROM df WHERE 1=0;")
-                con.append("match_metadata", df)
-                log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
-            else: 
-                log_message(f"Batch {chunk_idx} warning: No valid metadata returned for this chunk.")
-            await asyncio.sleep(1.0)
+                valid = [r for r in results if r is not None]
+                if valid:
+                    df = pd.DataFrame(valid)
+                    if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values:
+                        con.execute("DROP TABLE match_metadata;")
+                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM df WHERE 1=0;")
+                    con.append("match_metadata", df)
+                    batch_bar.set_postfix(inserted = len(valid))
+                    log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
+                else: 
+                    batch_bar.set_postfix(inserted = 0)
+                    log_message(f"Batch {chunk_idx} warning: No valid metadata returned for this chunk.")
+                await asyncio.sleep(1.0)
 
     log_message("Metadata Ingestion Complete.")
 
