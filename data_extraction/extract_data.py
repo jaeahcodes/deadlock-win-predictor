@@ -173,8 +173,25 @@ MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 async def fetch_metadata_async(batch_size: int = 5000):
     con.execute("CREATE TABLE IF NOT EXISTS match_metadata AS SELECT * FROM (SELECT 1 AS dummy) WHERE 1=0;")
 
+    log_message("Deduplicating match_metadata...")
+
+    dedup_query = """
+        CREATE OR REPLACE TABLE match_metadata AS
+        SELECT * EXCLUDE (row_num)
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY m.match_info.match_id) AS row_num
+            FROM match_metadata m
+        )
+        WHERE row_num = 1;
+    """
+    con.execute(dedup_query)
+    total_rows = con.execute("SELECT COUNT(*) FROM match_metadata;").fetchone()[0]
+    unique_rows = con.execute("SELECT COUNT(DISTINCT m.match_info.match_id) FROM match_metadata m;")
+    log_message(f"match_metadata deduplication complete\nTotal Rows: {total_rows:,} | Unique Rows: {unique_rows:,}")
+
     try:
-        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_metadata").fetchall())
+        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
     except Exception:
         fetched_ids = set()
 
