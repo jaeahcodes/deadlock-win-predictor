@@ -64,8 +64,8 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
                 log_message(f"No more files available for {name} at index {start_no}. Skipping this table.")
                 continue
 
-            log_message(f"Creating view for {name} using files {start_no} to {end_no}...")
-            con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
+            log_message(f"Creating table for {name} using files {start_no} to {end_no}...")
+            con.execute(f"CREATE OR REPLACE {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
 
     log_message("Phase 1: Extracting and inserting player features into persistent table")
     con.execute("""
@@ -210,10 +210,12 @@ async def fetch_metadata_async(batch_size: int = 5000):
                 valid = [r for r in results if r is not None]
                 if valid:
                     df = pd.DataFrame(valid)
+                    con.register('temp_df', df)
                     if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values:
                         con.execute("DROP TABLE match_metadata;")
-                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM df WHERE 1=0;")
-                    con.append("match_metadata", df)
+                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df WHERE 1=0;")
+                    con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                    con.unregister('temp_df')
                     batch_bar.set_postfix(inserted = len(valid))
                     log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
                 else: 
