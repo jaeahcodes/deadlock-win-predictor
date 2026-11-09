@@ -1,21 +1,30 @@
-import duckdb
-import requests
 import asyncio
 import httpx
-import sys
+import duckdb
+import os
 import pandas as pd
-from pathlib import Path
+import requests
 from datetime import datetime
+from dotenv import load_dotenv
+from pathlib import Path
 from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
+
 """
-This script executes in the following order:
-(1) Creates a "data" folder if it doesn't already exist, and initializes a .duckdb file. Initializes an extraction log .txt file.
-(2) Connects to DuckDB.
-(3) Executes fetch manifest. Creates view table if it doesn't already exist, and populates it with the retrieved data.
+Deadlock Data Pipeline & Extraction Manager
+
+This script serves as the centralized ingestion pipeline for ingesting, processing, and persisting Deadlock match telemetry, player statistics, and deep API JSON metadata into a local DuckDB database (deadlock.duckdb), with native AWS S3 Data Lake integration.
+
+Usage:
+    Run the script from the terminal to launch the interactive pipeline manager menu.
+    $ python extract_data.py
+
 """
 
-# 1. Initialize paths and logging
+# 1. Initialize environment variables
+load_dotenv()
+
+# 2. Initialize paths and logging
 script_dir = Path(__file__).resolve().parent
 base_dir = script_dir.parent.parent if script_dir.parent.name == "data_extraction" else script_dir.parent
 data_dir = base_dir / "data"
@@ -32,13 +41,23 @@ def log_message(message: str):
     with open(log_path, "a", encoding = "utf-8") as f:
         f.write(formatted_msg + "\n")
 
-# 2. Connect  to DuckDB
+# 3. Connect to DuckDB
 con = duckdb.connect(db_path)
-con.execute("SET threads = 1;")
-con.execute("SET memory_limit = '8GB';")
-con.execute("SET preserve_insertion_order = false;")
+con.execute("INSTALL httpfs; LOAD httpfs;")
 
-# 3. Fetch manifest
+aws_region = os.getenv('AWS_REGION', 'us-east-1')
+access_key = os.getenv('AWS_ACCESS_KEY_ID')
+secret_key = os.getenv('AWS_SECRET_ACCESS_Key')
+
+con.execute(f"SET s3_region = '{aws_region}';")
+con.execute(f"SET s3_access_key_id = '{access_key}';")
+con.execute(f"SET s3_secret_access_key = '{secret_key}';")
+
+log_message("DuckDB successfully configured with S3 credentials.")
+
+print(con.sql("SELECT * FROM glob('s3://deadlock-datalake-bucket-857745822625-us-east-2-an/');").df())
+
+# 4. Fetch manifest
 manifest = requests.get("https://data.deadlock-api.com/v1/manifest.json").json()
 base = manifest["public_url"]
 
@@ -171,32 +190,17 @@ match_id_query = """
 MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 
 async def fetch_metadata_async(batch_size: int = 5000):
-    con.execute("CREATE TABLE IF NOT EXISTS match_metadata AS SELECT * FROM (SELECT 1 AS dummy) WHERE 1=0;")
-
-    log_message("Deduplicating match_metadata...")
-
-    dedup_query = """
-        CREATE OR REPLACE TABLE match_metadata AS
-        SELECT * EXCLUDE (row_num)
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY m.match_info.match_id) AS row_num
-            FROM match_metadata m
-        )
-        WHERE row_num = 1;
-    """
-    con.execute(dedup_query)
-    total_rows = con.execute("SELECT COUNT(*) FROM match_metadata;").fetchone()[0]
-    unique_rows = con.execute("SELECT COUNT(DISTINCT m.match_info.match_id) FROM match_metadata m;")
-    log_message(f"match_metadata deduplication complete\nTotal Rows: {total_rows:,} | Unique Rows: {unique_rows:,}")
-
-    try:
-        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
-    except Exception:
+    table_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0
+    
+    if table_exists:
+        try:
+            fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
+        except Exception:
+            fetched_ids = set()
+    else:
         fetched_ids = set()
 
     pending_match_ids = [mid for mid in MATCH_ID_LIST if mid not in fetched_ids]
-
     log_message(f"Total matches: {len(MATCH_ID_LIST)} | Already fetched: {len(fetched_ids)}")
 
     if not pending_match_ids:
@@ -204,7 +208,6 @@ async def fetch_metadata_async(batch_size: int = 5000):
         return
 
     chunks = [pending_match_ids[i : i + batch_size] for i in range(0, len(pending_match_ids), batch_size)]
-    log_message(f"Split {len(pending_match_ids)} pending matches into {len(chunks)} batches of up to {batch_size}")
     semaphore = asyncio.Semaphore(15)
 
     async def fetch_one(client, mid):
@@ -228,16 +231,13 @@ async def fetch_metadata_async(batch_size: int = 5000):
                 if valid:
                     df = pd.DataFrame(valid)
                     con.register('temp_df', df)
-                    if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values:
-                        con.execute("DROP TABLE match_metadata;")
-                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df WHERE 1=0;")
-                    con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                    if not con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0:
+                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df;")
+                    else:
+                        con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
                     con.unregister('temp_df')
                     batch_bar.set_postfix(inserted = len(valid))
                     log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
-                else: 
-                    batch_bar.set_postfix(inserted = 0)
-                    log_message(f"Batch {chunk_idx} warning: No valid metadata returned for this chunk.")
                 await asyncio.sleep(1.0)
 
     log_message("Metadata Ingestion Complete.")
@@ -253,15 +253,14 @@ def main_menu():
         choice = input("\nEnter your choice (1-3): ").strip()
 
         if choice == '1': 
-            extract_match_player_salts_data_wrapper = getattr(sys.modules[__name__], 'extract_match_player_salts_data')
-            extract_match_player_salts_data_wrapper()
+            extract_match_player_salts_data()
         elif choice == '2':
             asyncio.run(fetch_metadata_async())
         elif choice == '3':
             print("Exiting pipeline.")
             break
         else: 
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            print("Invalid choice.")
 
 if __name__ == "__main__":
     main_menu()
