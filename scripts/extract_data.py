@@ -1,21 +1,27 @@
-import duckdb
-import requests
 import asyncio
 import httpx
-import sys
+import duckdb
+import os
 import pandas as pd
-from pathlib import Path
+import requests
 from datetime import datetime
+from dotenv import load_dotenv
+from pathlib import Path
 from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
+
 """
-This script executes in the following order:
-(1) Creates a "data" folder if it doesn't already exist, and initializes a .duckdb file. Initializes an extraction log .txt file.
-(2) Connects to DuckDB.
-(3) Executes fetch manifest. Creates view table if it doesn't already exist, and populates it with the retrieved data.
+Deadlock Data Pipeline & Extraction Manager
+
+This script serves as the centralized ingestion pipeline for ingesting, processing, and persisting 
+Deadlock match telemetry, player statistics, and deep API JSON metadata into a local DuckDB database 
+(deadlock.duckdb), capped at 10,000 target matches with full resume/skip logic.
 """
 
-# 1. Initialize paths and logging
+# 1. Initialize environment variables
+load_dotenv()
+
+# 2. Initialize paths and logging
 script_dir = Path(__file__).resolve().parent
 base_dir = script_dir.parent.parent if script_dir.parent.name == "data_extraction" else script_dir.parent
 data_dir = base_dir / "data"
@@ -32,13 +38,21 @@ def log_message(message: str):
     with open(log_path, "a", encoding = "utf-8") as f:
         f.write(formatted_msg + "\n")
 
-# 2. Connect  to DuckDB
+# 3. Connect to DuckDB & Configure S3
 con = duckdb.connect(db_path)
-con.execute("SET threads = 1;")
-con.execute("SET memory_limit = '8GB';")
-con.execute("SET preserve_insertion_order = false;")
+con.execute("INSTALL httpfs; LOAD httpfs;")
 
-# 3. Fetch manifest
+aws_region = os.getenv('AWS_REGION', 'us-east-1')
+access_key = os.getenv('AWS_ACCESS_KEY_ID')
+secret_key = os.getenv('AWS_SECRET_ACCESS_Key')
+
+con.execute(f"SET s3_region = '{aws_region}';")
+con.execute(f"SET s3_access_key_id = '{access_key}';")
+con.execute(f"SET s3_secret_access_key = '{secret_key}';")
+
+log_message("DuckDB successfully configured with S3 credentials.")
+
+# 4. Fetch manifest
 manifest = requests.get("https://data.deadlock-api.com/v1/manifest.json").json()
 base = manifest["public_url"]
 
@@ -50,12 +64,23 @@ def get_file_slice(table: str, start_idx: int, end_idx: int) -> list[str]:
                  if t["policy"] == "snapshot" or f.get("generation", 0) == gen]
     return file_list[start_idx : end_idx]
 
-SLICES = [(0, 15), (15, 23)]
+SLICES = [(0, 15)]
 TARGET_TABLES = ["match_salts", "match_player"]
+MAX_TARGET_MATCHES = 10000
 
-def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TABLES):
-    log_message(f"Starting Match Player Salts Data Extraction Run")
+def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = TARGET_TABLES):
+    log_message(f"Starting Match Player Salts Data Extraction Run (Target: {MAX_TARGET_MATCHES:,} matches)")
     start_no, end_no = idx_slice
+
+    # Check how many complete matches already stored
+    table_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'player_features'").fetchone()[0] > 0
+    existing_count = 0
+    if table_exists:
+        existing_count = con.execute("SELECT COUNT(DISTINCT match_id) FROM player_features").fetchone()[0]
+        log_message(f"Found existing player_features table with {existing_count:,} unique matches.")
+        if existing_count >= MAX_TARGET_MATCHES:
+            log_message(f"Target of {MAX_TARGET_MATCHES:,} matches already met. Skipping Parquet extraction.")
+            return
 
     for name in target_tables:
         if name in manifest["tables"]: 
@@ -100,7 +125,8 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
         JOIN match_player mp ON m.match_id = mp.match_id
     """)
 
-    con.execute("""
+    # Append only new match IDs that are not already present
+    con.execute(f"""
         INSERT INTO player_features
         SELECT 
             m.match_id,
@@ -133,19 +159,8 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
         WHERE m.match_id NOT IN (SELECT DISTINCT match_id FROM player_features);
     """)
 
-    log_message("Phase 2: Running inspection queries")
-    stats_query = """
-        SELECT
-            COUNT(DISTINCT match_id) AS total_unique_matches,
-            COUNT(*) AS total_player_rows,
-            COUNT(*) / NULLIF(COUNT(DISTINCT match_id), 0) AS avg_players_per_match
-        FROM player_features
-    """
-    stats_df = con.sql(stats_query).df()
-    log_message(str(stats_df))
-
-    log_message("Phase 3: Keeping only matches with 12 player data")
-    full_match_query = """
+    log_message("Phase 2: Filtering for matches with exactly 12 player data records and capping at target")
+    con.execute(f"""
         CREATE OR REPLACE TABLE player_features AS
         SELECT pf.*
         FROM player_features pf
@@ -154,57 +169,47 @@ def extract_match_player_salts_data(idx_slice: tuple, target_tables = TARGET_TAB
             FROM player_features
             GROUP BY match_id
             HAVING COUNT(*) = 12
+            LIMIT {MAX_TARGET_MATCHES}
         ) complete_matches ON pf.match_id = complete_matches.match_id
+    """)
+
+    stats_query = """
+        SELECT
+            COUNT(DISTINCT match_id) AS total_unique_matches,
+            COUNT(*) AS total_player_rows
+        FROM player_features
     """
-    con.execute(full_match_query)
-
-    log_message("Phase 4: Re-running inspection queries")
-    final_stats_df = con.sql(stats_query)
-    log_message(str(final_stats_df))
-
+    final_stats_df = con.sql(stats_query).df()
+    log_message(f"Parquet Extraction Milestone Completed:\n{final_stats_df}")
     log_message("Extraction Run Finished Successfully")
 
-match_id_query = """
-    SELECT DISTINCT match_id
-    FROM player_features
-"""
-MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
-
-async def fetch_metadata_async(batch_size: int = 5000):
-    con.execute("CREATE TABLE IF NOT EXISTS match_metadata AS SELECT * FROM (SELECT 1 AS dummy) WHERE 1=0;")
-
-    log_message("Deduplicating match_metadata...")
-
-    dedup_query = """
-        CREATE OR REPLACE TABLE match_metadata AS
-        SELECT * EXCLUDE (row_num)
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY m.match_info.match_id) AS row_num
-            FROM match_metadata m
-        )
-        WHERE row_num = 1;
+async def fetch_metadata_async(batch_size: int = 1000):
+    # Get current match ID list from player_features, capped at MAX_TARGET_MATCHES
+    match_id_query = f"""
+        SELECT DISTINCT match_id
+        FROM player_features
+        LIMIT {MAX_TARGET_MATCHES}
     """
-    con.execute(dedup_query)
-    total_rows = con.execute("SELECT COUNT(*) FROM match_metadata;").fetchone()[0]
-    unique_rows = con.execute("SELECT COUNT(DISTINCT m.match_info.match_id) FROM match_metadata m;")
-    log_message(f"match_metadata deduplication complete\nTotal Rows: {total_rows:,} | Unique Rows: {unique_rows:,}")
+    MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
 
-    try:
-        fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
-    except Exception:
+    table_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0
+    
+    if table_exists:
+        try:
+            fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
+        except Exception:
+            fetched_ids = set()
+    else:
         fetched_ids = set()
 
     pending_match_ids = [mid for mid in MATCH_ID_LIST if mid not in fetched_ids]
-
-    log_message(f"Total matches: {len(MATCH_ID_LIST)} | Already fetched: {len(fetched_ids)}")
+    log_message(f"Metadata Target: {len(MATCH_ID_LIST)} | Already Fetched & Saved: {len(fetched_ids)} | Pending: {len(pending_match_ids)}")
 
     if not pending_match_ids:
-        log_message("Metadata is fully up to date.")
+        log_message("Metadata is fully up to date for the target match set.")
         return
 
     chunks = [pending_match_ids[i : i + batch_size] for i in range(0, len(pending_match_ids), batch_size)]
-    log_message(f"Split {len(pending_match_ids)} pending matches into {len(chunks)} batches of up to {batch_size}")
     semaphore = asyncio.Semaphore(15)
 
     async def fetch_one(client, mid):
@@ -228,16 +233,13 @@ async def fetch_metadata_async(batch_size: int = 5000):
                 if valid:
                     df = pd.DataFrame(valid)
                     con.register('temp_df', df)
-                    if "dummy" in con.execute("DESCRIBE match_metadata").fetchdf()["column_name"].values:
-                        con.execute("DROP TABLE match_metadata;")
-                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df WHERE 1=0;")
-                    con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                    if not con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0:
+                        con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df;")
+                    else:
+                        con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
                     con.unregister('temp_df')
                     batch_bar.set_postfix(inserted = len(valid))
                     log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
-                else: 
-                    batch_bar.set_postfix(inserted = 0)
-                    log_message(f"Batch {chunk_idx} warning: No valid metadata returned for this chunk.")
                 await asyncio.sleep(1.0)
 
     log_message("Metadata Ingestion Complete.")
@@ -247,21 +249,21 @@ def main_menu():
         print("\n=================================")
         print("    DEADLOCK PIPELINE MANAGER    ")
         print("=================================")
+        print(f"Target Capacity: {MAX_TARGET_MATCHES:,} Matches")
         print("1. Extract Match Player & Salts Data (Parquet)")
         print("2. Extract Match Metadata (Async API)")
         print("3. Exit")
         choice = input("\nEnter your choice (1-3): ").strip()
 
         if choice == '1': 
-            extract_match_player_salts_data_wrapper = getattr(sys.modules[__name__], 'extract_match_player_salts_data')
-            extract_match_player_salts_data_wrapper()
+            extract_match_player_salts_data()
         elif choice == '2':
             asyncio.run(fetch_metadata_async())
         elif choice == '3':
             print("Exiting pipeline.")
             break
         else: 
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            print("Invalid choice.")
 
 if __name__ == "__main__":
     main_menu()
