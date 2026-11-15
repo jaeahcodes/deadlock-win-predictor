@@ -15,10 +15,12 @@ Deadlock Data Pipeline & Extraction Manager
 
 This script serves as the centralized ingestion pipeline for ingesting, processing, and persisting 
 Deadlock match telemetry, player statistics, and deep API JSON metadata into a local DuckDB database 
-(deadlock.duckdb), capped at 10,000 target matches with full resume/skip logic.
+(deadlock.duckdb), capped at 100,000 target match salts data and 10,000 match metadata with full resume/skip logic.
 """
 
 # 1. Initialize environment variables
+MAX_TARGET_MATCHES = 200000
+MAX_TARGET_METADATA = 10000
 load_dotenv()
 
 # 2. Initialize paths and logging
@@ -42,6 +44,10 @@ def log_message(message: str):
 con = duckdb.connect(db_path)
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
+con.execute("SET threads = 1;")
+con.execute("SET preserve_insertion_order = false;")
+con.execute("SET memory_limit = '8GB';")
+
 aws_region = os.getenv('AWS_REGION', 'us-east-1')
 access_key = os.getenv('AWS_ACCESS_KEY_ID')
 secret_key = os.getenv('AWS_SECRET_ACCESS_Key')
@@ -64,16 +70,17 @@ def get_file_slice(table: str, start_idx: int, end_idx: int) -> list[str]:
                  if t["policy"] == "snapshot" or f.get("generation", 0) == gen]
     return file_list[start_idx : end_idx]
 
-SLICES = [(0, 15)]
+SLICES = [(0, 15), (15, 23), (23, 25)]
 TARGET_TABLES = ["match_salts", "match_player"]
-MAX_TARGET_MATCHES = 10000
 
 def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = TARGET_TABLES):
     log_message(f"Starting Match Player Salts Data Extraction Run (Target: {MAX_TARGET_MATCHES:,} matches)")
     start_no, end_no = idx_slice
 
-    # Check how many complete matches already stored
-    table_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'player_features'").fetchone()[0] > 0
+    # Check how many complete matches we already have stored (fully consuming result)
+    table_exists_res = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'player_features'").fetchone()
+    table_exists = table_exists_res[0] > 0 if table_exists_res else False
+    
     existing_count = 0
     if table_exists:
         existing_count = con.execute("SELECT COUNT(DISTINCT match_id) FROM player_features").fetchone()[0]
@@ -90,7 +97,7 @@ def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = 
                 continue
 
             log_message(f"Creating table for {name} using files {start_no} to {end_no}...")
-            con.execute(f"CREATE OR REPLACE {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
+            con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM read_parquet({file_urls!r}, union_by_name = true)")
 
     log_message("Phase 1: Extracting and inserting player features into persistent table")
     con.execute("""
@@ -184,28 +191,30 @@ def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = 
     log_message("Extraction Run Finished Successfully")
 
 async def fetch_metadata_async(batch_size: int = 1000):
-    # Get current match ID list from player_features, capped at MAX_TARGET_MATCHES
+    # Reuse the main active connection `con` since results are immediately consumed into lists/sets
     match_id_query = f"""
         SELECT DISTINCT match_id
         FROM player_features
         LIMIT {MAX_TARGET_MATCHES}
     """
     MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
-
-    table_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0
     
+    table_exists_res = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()
+    table_exists = table_exists_res[0] > 0 if table_exists_res else False
+    con.complete()
+    
+    fetched_ids = set()
     if table_exists:
         try:
             fetched_ids = set(r[0] for r in con.execute("SELECT DISTINCT m.match_info.match_id FROM match_metadata m").fetchall())
+            con.complete()
         except Exception:
             fetched_ids = set()
-    else:
-        fetched_ids = set()
 
     pending_match_ids = [mid for mid in MATCH_ID_LIST if mid not in fetched_ids]
-    log_message(f"Metadata Target: {len(MATCH_ID_LIST)} | Already Fetched & Saved: {len(fetched_ids)} | Pending: {len(pending_match_ids)}")
+    log_message(f"Metadata Target: {MAX_TARGET_METADATA} | Already Fetched & Saved: {len(fetched_ids)} | Available: {len(pending_match_ids)}")
 
-    if not pending_match_ids:
+    if len(fetched_ids) >= MAX_TARGET_METADATA:
         log_message("Metadata is fully up to date for the target match set.")
         return
 
@@ -233,11 +242,25 @@ async def fetch_metadata_async(batch_size: int = 1000):
                 if valid:
                     df = pd.DataFrame(valid)
                     con.register('temp_df', df)
-                    if not con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()[0] > 0:
+                    
+                    chk_res = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()
+                    table_present = chk_res[0] > 0 if chk_res else False
+                    con.complete()
+                    
+                    if not table_present:
                         con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df;")
+                        con.complete()
                     else:
-                        con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                            try:
+                                con.execute("INSERT INTO match_metadata SELECT * FROM temp_df;")
+                                con.complete()
+                            except duckdb.ConversionException as e:
+                                log_message(f"Schema type mismatch detected: {e}. Recreating match_metadata with wider types...")
+                                con.execute("DROP TABLE match_metadata;")
+                                con.execute("CREATE TABLE match_metadata AS SELECT * FROM temp_df;")
+                        
                     con.unregister('temp_df')
+                    
                     batch_bar.set_postfix(inserted = len(valid))
                     log_message(f"Batch {chunk_idx} committed: Successfully inserted {len(valid)} records.")
                 await asyncio.sleep(1.0)
@@ -249,14 +272,16 @@ def main_menu():
         print("\n=================================")
         print("    DEADLOCK PIPELINE MANAGER    ")
         print("=================================")
-        print(f"Target Capacity: {MAX_TARGET_MATCHES:,} Matches")
+        print(f"Target Match Capacity: {MAX_TARGET_MATCHES:,} Matches")
+        print(f"Target Match Metadata Capacity: {MAX_TARGET_METADATA:,} Matches")
         print("1. Extract Match Player & Salts Data (Parquet)")
         print("2. Extract Match Metadata (Async API)")
         print("3. Exit")
         choice = input("\nEnter your choice (1-3): ").strip()
 
         if choice == '1': 
-            extract_match_player_salts_data()
+            for pair in SLICES:
+                extract_match_player_salts_data(idx_slice = pair)
         elif choice == '2':
             asyncio.run(fetch_metadata_async())
         elif choice == '3':
