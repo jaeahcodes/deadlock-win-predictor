@@ -30,6 +30,8 @@ data_dir = base_dir / "data"
 
 db_path = str(data_dir / "deadlock.duckdb")
 log_path = data_dir / "extraction_logs.txt"
+output_dir = data_dir / "telemetry_timeseries_parquet"
+output_dir.mkdir(exist_ok = True, parents = True)
 
 def log_message(message: str):
     """Prints to terminal and appends to extraction_logs.txt simultaneously."""
@@ -40,23 +42,24 @@ def log_message(message: str):
     with open(log_path, "a", encoding = "utf-8") as f:
         f.write(formatted_msg + "\n")
 
-# 3. Connect to DuckDB & Configure S3
-con = duckdb.connect(db_path)
-con.execute("INSTALL httpfs; LOAD httpfs;")
+# 3. Function to connect to DuckDB & Configure S3
+def connect_to_db(database_path = db_path, read_only = False):
+    con = duckdb.connect(db_path, read_only = read_only)
+    con.execute("INSTALL httpfs; LOAD httpfs;")
 
-con.execute("SET threads = 1;")
-con.execute("SET preserve_insertion_order = false;")
-con.execute("SET memory_limit = '8GB';")
+    con.execute("SET threads = 1;")
+    con.execute("SET preserve_insertion_order = false;")
+    con.execute("SET memory_limit = '8GB';")
 
-aws_region = os.getenv('AWS_REGION', 'us-east-1')
-access_key = os.getenv('AWS_ACCESS_KEY_ID')
-secret_key = os.getenv('AWS_SECRET_ACCESS_Key')
+    aws_region = os.getenv('AWS_REGION', 'us-east-1')
+    access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    secret_key = os.getenv('AWS_SECRET_ACCESS_Key')
 
-con.execute(f"SET s3_region = '{aws_region}';")
-con.execute(f"SET s3_access_key_id = '{access_key}';")
-con.execute(f"SET s3_secret_access_key = '{secret_key}';")
-
-log_message("DuckDB successfully configured with S3 credentials.")
+    con.execute(f"SET s3_region = '{aws_region}';")
+    con.execute(f"SET s3_access_key_id = '{access_key}';")
+    con.execute(f"SET s3_secret_access_key = '{secret_key}';")
+    log_message("DuckDB successfully configured with S3 credentials.")
+    return con
 
 # 4. Fetch manifest
 manifest = requests.get("https://data.deadlock-api.com/v1/manifest.json").json()
@@ -76,6 +79,8 @@ TARGET_TABLES = ["match_salts", "match_player"]
 def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = TARGET_TABLES):
     log_message(f"Starting Match Player Salts Data Extraction Run (Target: {MAX_TARGET_MATCHES:,} matches)")
     start_no, end_no = idx_slice
+
+    con = connect_to_db()
 
     # Check how many complete matches we already have stored (fully consuming result)
     table_exists_res = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'player_features'").fetchone()
@@ -189,7 +194,9 @@ def extract_match_player_salts_data(idx_slice: tuple = (0, 15), target_tables = 
     final_stats_df = con.sql(stats_query).df()
     log_message(f"Parquet Extraction Milestone Completed:\n{final_stats_df}")
     log_message("Extraction Run Finished Successfully")
+    con.close()
 
+# 5. Fetch metadata (async)
 async def fetch_metadata_async(batch_size: int = 1000):
     # Reuse the main active connection `con` since results are immediately consumed into lists/sets
     match_id_query = f"""
@@ -197,6 +204,8 @@ async def fetch_metadata_async(batch_size: int = 1000):
         FROM player_features
         LIMIT {MAX_TARGET_MATCHES}
     """
+    con = connect_to_db()
+
     MATCH_ID_LIST = [r[0] for r in con.execute(match_id_query).fetchall()]
     
     table_exists_res = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'match_metadata'").fetchone()
@@ -266,6 +275,107 @@ async def fetch_metadata_async(batch_size: int = 1000):
                 await asyncio.sleep(1.0)
 
     log_message("Metadata Ingestion Complete.")
+    con.close()
+
+# 6. Clean and bin metadata
+def clean_and_bin_metadata(batch_size: int = 500):
+    """
+    Streams match_metadata in batches, bins time_stamp_s to every 300 seconds, 
+    aggregates metrics with MAX(), and exports directly to resumable ZSTD Parquet files.
+    """
+
+    con = connect_to_db(read_only = True)
+    log_message("Starting 300s Telemetry Binning & Parquet Export...")
+
+    total_rows = con.execute("SELECT count(*) FROM match_metadata").fetchone()[0]
+    con.complete()
+    log_message(f"Total matches to process: {total_rows:,}")
+
+    offsets = list(range(0, total_rows, batch_size))
+
+    with tqdm(offsets, desc = "Exporting Parquet Batches", unit = "batch") as pbar:
+        for offset in pbar:
+            batch_num = offset // batch_size
+            out_file = os.path.join(output_dir, f"tick_stats_part_{batch_num:04d}.parquet")
+            
+            # Skip if already processed (makes the script fully resumable)
+            if os.path.exists(out_file):
+                continue
+
+            query = f"""
+            COPY (
+                WITH match_batch AS (
+                    SELECT match_info
+                    FROM match_metadata
+                    LIMIT {batch_size} OFFSET {offset}
+                ),
+                raw_ticks AS (
+                    SELECT 
+                        m.match_info.match_id AS match_id,
+                        p.team AS team,
+                        p.hero_id AS hero_id,
+                        CAST(ROUND(s.time_stamp_s / 300.0) * 300 AS INTEGER) AS time_stamp_s,
+                        s.net_worth AS tick_net_worth,
+                        s.kills AS tick_kills,
+                        s.deaths AS tick_deaths,
+                        s.assists AS tick_assists,
+                        s.creep_damage AS creep_damage,
+                        s.player_damage AS player_damage,
+                        s.neutral_damage AS neutral_damage,
+                        s.boss_damage AS boss_damage,
+                        s.denies AS denies,
+                        s.player_healing AS player_healing,
+                        s.self_healing AS self_healing,
+                        s.player_damage_taken AS player_damage_taken,
+                        s.damage_absorbed AS damage_absorbed,
+                        s.shots_hit AS shots_hit,
+                        s.shots_missed AS shots_missed,
+                        s."level" AS level
+                    FROM match_batch AS m
+                    CROSS JOIN UNNEST(m.match_info.players) AS t1(p)
+                    CROSS JOIN UNNEST(p.stats) AS t2(s)
+                    WHERE m.match_info IS NOT NULL 
+                    AND p.stats IS NOT NULL
+                )
+                SELECT 
+                    match_id,
+                    team,
+                    hero_id,
+                    time_stamp_s,
+                    MAX(tick_net_worth) AS tick_net_worth,
+                    MAX(tick_kills) AS tick_kills,
+                    MAX(tick_deaths) AS tick_deaths,
+                    MAX(tick_assists) AS tick_assists,
+                    MAX(creep_damage) AS creep_damage,
+                    MAX(player_damage) AS player_damage,
+                    MAX(neutral_damage) AS neutral_damage,
+                    MAX(boss_damage) AS boss_damage,
+                    MAX(denies) AS denies,
+                    MAX(player_healing) AS player_healing,
+                    MAX(self_healing) AS self_healing,
+                    MAX(player_damage_taken) AS player_damage_taken,
+                    MAX(damage_absorbed) AS damage_absorbed,
+                    MAX(shots_hit) AS shots_hit,
+                    MAX(shots_missed) AS shots_missed,
+                    MAX(level) AS level
+                FROM raw_ticks
+                GROUP BY match_id, team, hero_id, time_stamp_s
+                ORDER BY match_id, team, hero_id, time_stamp_s
+            ) TO '{out_file}' (
+                FORMAT PARQUET, 
+                COMPRESSION ZSTD, 
+                COMPRESSION_LEVEL 6,
+                ROW_GROUP_SIZE 100000
+            );
+            """
+            
+            con.execute(query)
+            con.complete()
+            pbar.set_postfix(status = f"Exported part_{batch_num:04d}")
+            log_message(f"Exported ({min(offset + batch_size, total_rows):,}/{total_rows:,})")
+
+    log_message("\n--- Parquet Export & 300s Binning Complete ---")
+    con.close()
 
 def main_menu():
     while True:
@@ -276,8 +386,9 @@ def main_menu():
         print(f"Target Match Metadata Capacity: {MAX_TARGET_METADATA:,} Matches")
         print("1. Extract Match Player & Salts Data (Parquet)")
         print("2. Extract Match Metadata (Async API)")
-        print("3. Exit")
-        choice = input("\nEnter your choice (1-3): ").strip()
+        print("3. Clean and Bin Metadata to 300s Parquet")
+        print("4. Exit")
+        choice = input("\nEnter your choice (1-4): ").strip()
 
         if choice == '1': 
             for pair in SLICES:
@@ -285,6 +396,8 @@ def main_menu():
         elif choice == '2':
             asyncio.run(fetch_metadata_async())
         elif choice == '3':
+            clean_and_bin_metadata()
+        elif choice == '4':
             print("Exiting pipeline.")
             break
         else: 
