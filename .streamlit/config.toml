@@ -1,0 +1,26 @@
+[theme]
+
+backgroundColor = "#fff6e9"
+
+primaryColor = "#201e1f"
+
+textColor = "#0f0803"
+
+font = "sans serif"
+
+
+# sidebar colors & styling
+[theme.sidebar]
+
+# background of sidebar
+backgroundColor = "#244153"
+
+# button color (search)
+primaryColor = "#49a467"
+
+# text coloring
+textColor = "#fbeedb"
+
+# dataframe and text box colors
+secondaryBackgroundColor = "#2e7360"
+
