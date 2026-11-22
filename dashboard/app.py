@@ -9,6 +9,7 @@ st.set_page_config(
 summary_page = st.Page(
     "pages/summary.py",
     title = "Research Summary",
+    icon = ":material/analytics:",
     default = True
 )
 
@@ -16,12 +17,14 @@ summary_page = st.Page(
 player_page = st.Page(
     "pages/player_analysis.py",
     title = "Player Analysis",
+    icon = ":material/manage_search:"
 )
 
 # page for full research paper
 paper_page = st.Page(
     "pages/paper.py",
     title = "Research Paper",
+    icon = ":material/article:"
 )
 
 pg = st.navigation(

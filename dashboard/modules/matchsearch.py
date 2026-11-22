@@ -74,12 +74,12 @@ con = duckdb.connect()
 
 # function for searching matches under a given player
 class matchSearcher:
-    def __init__(self, con, accountID = None, matchID = None):
+    def __init__(self, con, matchID = None, heroID = None):
         self.con = con
-        self.accountID = accountID
+        self.heroID = heroID
         self.matchID = matchID
     
-    def findPlayerMatches(self, data, accountID = None):
+    def findPlayerMatches(self, data, matchID = None):
         """
         This function pulls a list of matches for a given account ID
         It uses SQL to accomplish this grabbing only matches where the ID is present.
@@ -93,44 +93,87 @@ class matchSearcher:
                 start_time, hero_id, and hero_name.
         """
         
-        accountID = accountID if accountID is not None else self.accountID
+        matchID = matchID if matchID is not None else self.matchID
         
         extracted_matches = self.con.execute(f"""
-        SELECT match_id, duration_s, start_time, hero_id
+        SELECT 
+            MAX(stat_time_stamp_s / 60) as duration_minutes,
+            match_id, 
+            hero_id,
+            team,
+            winning_team,
+            CASE WHEN
+                winning_team = team THEN 'Won'
+                ELSE 'Lost'
+            END AS outcome
         FROM {data}
-        WHERE account_id = ?
-        ORDER BY start_time DESC""", [accountID]).df()
+        WHERE match_id = ? 
+        GROUP BY 
+            match_id, 
+            hero_id, 
+            team,
+            winning_team
+        HAVING duration_minutes > 0
+        ORDER BY team
+        """, [matchID]).df()
         
-        extracted_matches["hero_name"] = (
+        extracted_matches["hero"] = (
             extracted_matches["hero_id"]
             .map(ALL_HEROES)
             .fillna("Unknown Hero"))
         
         return extracted_matches
     
-    def playerMatchInfo(self, data, accountID = None, matchID = None):
+    def playerMatchInfo(self, data, team, heroID = None, matchID = None):
         """
         Pulls information from table only including data where the account_id is present.
         This is to be used for making graphs and displaying player stats such as Kills, Deaths, Networth, etc.
         
         Args:
             data (str): name of the DuckDB table containing match information
-            accountID (int, optional): Players Steam ID to be matched in the table. Defaults to ID stored in class.
             matchID (int, optional): Numeric ID for a played match to be analyzed. Defaults to ID stored in class.
             
         Returns:
             pd.DataFrame: Match records containing all information, only where the accountID and matchID matches user input.
         """
         
-        accountID = accountID if accountID is not None else self.accountID
         matchID = matchID if matchID is not None else self.matchID
+        heroID = heroID if heroID is not None else self.heroID
+        
+        # change account_id to player_account_id
+        # change timestamp to stat_time_stamp_s
         
         extracted_rows = self.con.execute(f"""
-        SELECT *
+        SELECT DISTINCT
+            hero_id, 
+            match_id, 
+            (stat_time_stamp_s / 60) as minutes,
+            player_kills,
+            player_deaths,
+            player_assists,
+            player_net_worth,
+            (COALESCE(gold_player, 0) +
+            COALESCE(gold_player_orbs, 0)) AS gold_players,
+            (COALESCE(gold_lane_creep, 0) +
+            COALESCE(gold_lane_creep_orbs, 0)) AS gold_laning,
+            (COALESCE(gold_neutral_creep, 0) +
+            COALESCE(gold_neutral_creep_orbs, 0)) AS gold_neutral,
+            (COALESCE(gold_boss, 0) +
+            COALESCE(gold_boss_orb, 0)) AS gold_bosses,
+            gold_treasure,
+            gold_denied,
+            total_kills,
+            total_deaths,
+            total_assists,
+            total_net_worth
         FROM {data}
-        WHERE account_id = ?
+        WHERE hero_id = ?
+        AND team = ?
         AND match_id = ?
-        ORDER BY timestamp ASC""", [accountID, matchID]).df()
+        ORDER BY stat_time_stamp_s ASC""", [heroID, team, matchID]).df()
+        
+        extracted_rows = extracted_rows.fillna(0)
+        
         
         return extracted_rows
     
@@ -141,7 +184,6 @@ class matchSearcher:
 
         Args:
             data (str): name of the DuckDB table containing match information
-            accountID (int, optional): Players Steam ID to be matched in the table. Defaults to ID stored in class.
             matchID (int, optional): Numeric ID for a played match to be analyzed. Defaults to ID stored in class.
             
         Returns:
@@ -155,5 +197,6 @@ class matchSearcher:
         FROM {data} 
         WHERE match_id = ?
         """, [matchID]).df()
+        modeled_rows = modeled_rows.fillna(0)
         
         return modeled_rows

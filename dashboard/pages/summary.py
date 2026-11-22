@@ -1,6 +1,18 @@
 import streamlit as st
 
 
+# removes awkward padding before the title
+st.markdown(
+    body="""
+        <style>
+            .block-container{
+                    padding-top: 25px;
+                }
+        </style>
+    """, 
+    unsafe_allow_html = True
+)
+
 st.set_page_config(
     page_title="Deadlock Match Analysis",
     layout="wide"
@@ -11,12 +23,12 @@ st.title("Predicting Deadlock Match Outcomes", text_alignment = "center")
 st.caption(
     "Capstone Project | University of Michigan "
     "Master of Applied Data Science",
-    text_alignment="center"
+    text_alignment = "center"
 )
 
 st.caption(
     "Jaeah Kim | Carter Pasternak | Taha Ziad",
-    text_alignment="center"
+    text_alignment = "center"
 )
 
 

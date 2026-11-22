@@ -1,5 +1,18 @@
 import streamlit as st
 
+
+# removes awkward padding before the title
+st.markdown(
+    body="""
+        <style>
+            .block-container{
+                    padding-top: 25px;
+                }
+        </style>
+    """, 
+    unsafe_allow_html = True
+)
+
 # creating page discussing "paper" details, i.e. report like analysis
 st.title("Predicting Deadlock Match Outcomes")
 
