@@ -13,7 +13,7 @@ from common import (
     connect_to_db
 )
 
-async def fetch_metadat_async(
+async def fetch_metadata_async(
     max_matches: int = MAX_TARGET_MATCHES,
     batch_size: int = 1000,
     slice_start: int = 0,
@@ -86,3 +86,32 @@ async def fetch_metadat_async(
                 results = await tqdm_asyncio.gather(*tasks, desc = f"Batch {chunk_idx}", leave = False)
 
                 valid = [r for r in results if r is not None]
+                if valid:
+                    out_file = raw_path / f"metadata_part_{next_part_idx:04d}.parquet"
+                    pd.DataFrame(valid).to_parquet(out_file, compression = 'zstd', index = False)
+                    next_part_idx += 1
+                    batch_bar.set_postfix(saved = len(valid))
+                await asyncio.sleep(1.0)
+    
+    log_message("Metadata Parquet Staging Complete.")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description = "Stage Deadlock match metadata to ZSTD Parquet.")
+    parser.add_argument("--max-matches", type = int, default = MAX_TARGET_MATCHES)
+    parser.add_argument("--batch-size", type = int, default = 1000)
+    parser.add_argument("--slice-start", type = int, default = 0)
+    parser.add_argument("--slice-end", type = int, default = 30)
+    parser.add_argument("--raw-dir", type = str, default = None)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    asyncio.run(
+        fetch_metadata_async(
+            max_matches = args.max_matches,
+            batch_size = args.batch_size,
+            slice_start = args.slice_start,
+            slice_end = args.slice_end,
+            raw_dir = args.raw_dir
+        )
+    )
