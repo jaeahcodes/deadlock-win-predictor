@@ -53,7 +53,7 @@ def run_interactive_menu() -> None:
         try:
             if choice == '1':
                 max_matches = _prompt_int("Max target matches", MAX_TARGET_MATCHES)
-                batch_size = _prompt_int("Extract batch size", 1000)
+                batch_size = _prompt_int("Extract batch size", 200)
                 slice_start = _prompt_int("Manifest slice start", 0)
                 slice_end = _prompt_int("Manifest slice end", 30)
                 raw_dir = _prompt_str("Custon raw Parquet dir", raw_dir)
@@ -71,7 +71,7 @@ def run_interactive_menu() -> None:
 
             elif choice == '2':
                 bin_seconds = _prompt_int("Time bin width in seconds (e.g. 180 or 300)", 180)
-                batch_size = _prompt_int("Binning batch size", 100)
+                batch_size = _prompt_int("Binning batch size", 25)
                 raw_dir = _prompt_str("Custom raw Parquet dir", raw_dir)
                 ts_dir = _prompt_str("Custom timeseries Parquet dir", ts_dir)
 
@@ -85,8 +85,8 @@ def run_interactive_menu() -> None:
             
             elif choice == "3":
                 max_matches = _prompt_int("Max target matches", MAX_TARGET_MATCHES)
-                ext_batch = _prompt_int("Extract batch size", 1000)
-                bin_batch = _prompt_int("Binning batch size", 100)
+                ext_batch = _prompt_int("Extract batch size", 200)
+                bin_batch = _prompt_int("Binning batch size", 25)
                 bin_seconds = _prompt_int("Time bin width in seconds", 180)
                 raw_dir = _prompt_str("Custom raw Parquet dir", raw_dir)
                 ts_dir = _prompt_str("Custom timeseries Parquet dir", ts_dir)

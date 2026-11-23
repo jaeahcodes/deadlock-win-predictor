@@ -57,7 +57,7 @@ def connect_to_db(database_path: str = db_path, read_only: bool = False):
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET threads = 1;")
     con.execute("SET preserve_insertion_order = false;")
-    con.execute("SET memory_limit = '2GB';")
+    con.execute("SET memory_limit = '4GB';")
 
     return con
 
