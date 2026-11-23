@@ -5,7 +5,7 @@ from tqdm import tqdm
 from common import connect_to_db, log_message, resolve_dirs
 
 def clean_and_bin_metadata(
-    batch_size: int = 100,
+    batch_size: int = 50,
     bin_seconds: int = 180, 
     raw_dir: str | None = None,
     timeseries_dir_override: str | None = None

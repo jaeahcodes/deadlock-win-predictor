@@ -124,7 +124,7 @@ def run_interactive_menu() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog = "deadlock-cli", description = "Deadlock Telemetry CLI.")
-    subparsers = parser.add_subparsers(dset = "command", required = True)
+    subparsers = parser.add_subparsers(dest = "command", required = True)
 
     p_extract = subparsers.add_parser("extract", help = "Fetch raw match metadata to ZSTD Parquet.")
     p_extract.add_argument("--max-matches", type = int, default = MAX_TARGET_MATCHES)
@@ -152,44 +152,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def main() -> None:
+    if len(sys.argv) == 1:
+        run_interactive_menu()
+        return
+    
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command == "extract":
-        asyncio.run(
-            fetch_metadata_async(
-                max_matches = args.max_matches,
+    if not args.command:
+        parser.print_help()
+        return
+
+    try:
+        if args.command == "status":
+            print_status(raw_dir = args.raw_dir, timeseries_dir_override = args.timeseries_dir)
+        
+    
+        elif args.command == "extract":
+            asyncio.run(
+                fetch_metadata_async(
+                    max_matches = args.max_matches,
+                    batch_size = args.batch_size,
+                    slice_start = args.slice_start,
+                    slice_end = args.slice_end,
+                    raw_dir = args.raw_dir
+                )
+            )
+
+        elif args.command == "bin":
+            clean_and_bin_metadata(
                 batch_size = args.batch_size,
-                slice_start = args.slice_start,
-                slice_end = args.slice_end,
-                raw_dir = args.raw_dir
+                bin_seconds = args.bin_seconds,
+                raw_dir = args.raw_dir,
+                timeseries_dir_override = args.timeseries_dir
             )
-        )
 
-    elif args.command == "bin":
-        clean_and_bin_metadata(
-            batch_size = args.batch_size,
-            bin_seconds = args.bin_seconds,
-            raw_dir = args.raw_dir,
-            timeseries_dir_override = args.timeseries_dir
-        )
-
-    elif args.command == "all":
-        asyncio.run(
-            fetch_metadata_async(
-                max_matches = args.max_matches,
-                batch_size = args.extract_batch_size,
-                slice_start = args.slice_start,
-                slice_end = args.slice_end,
-                raw_dir = args.raw_dir
+        elif args.command == "all":
+            asyncio.run(
+                fetch_metadata_async(
+                    max_matches = args.max_matches,
+                    batch_size = args.extract_batch_size,
+                    slice_start = args.slice_start,
+                    slice_end = args.slice_end,
+                    raw_dir = args.raw_dir
+                )
             )
-        )
-        clean_and_bin_metadata(
-            batch_size = args.bin_batch_size,
-            bin_seconds = args.bin_seconds,
-            raw_dir = args.raw_dir,
-            timeseries_dir_override = args.timeseries_dir
-        )
+            clean_and_bin_metadata(
+                batch_size = args.bin_batch_size,
+                bin_seconds = args.bin_seconds,
+                raw_dir = args.raw_dir,
+                timeseries_dir_override = args.timeseries_dir
+            )
+
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
 
 if __name__ == "__main__":
     main()

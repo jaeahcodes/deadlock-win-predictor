@@ -13,9 +13,17 @@ from common import (
     connect_to_db
 )
 
+def _sanitize_for_parquet(obj):
+    """Replaces empty dicts with None so PyArrow does not infer zero-field structs."""
+    if isinstance(obj, dict):
+        cleaned = {k: _sanitize_for_parquet(v) for k, v in obj.items()}
+        return cleaned if len(cleaned) > 0 else None
+    if isinstance(obj, list):
+        return[_sanitize_for_parquet(item) for item in obj]
+
 async def fetch_metadata_async(
     max_matches: int = MAX_TARGET_MATCHES,
-    batch_size: int = 1000,
+    batch_size: int = 200,
     slice_start: int = 0,
     slice_end: int = 30,
     raw_dir: str | None = None
@@ -80,12 +88,12 @@ async def fetch_metadata_async(
             return None
 
     async with httpx.AsyncClient() as client:
-        with tqdm(chunks, desc = "Matadata Batches", unit = "batch", leave = False) as batch_bar:
+        with tqdm(chunks, desc = "Metadata Batches", unit = "batch", leave = False) as batch_bar:
             for chunk_idx, chunk in enumerate(batch_bar, 1):
                 tasks = [fetch_one(client, mid) for mid in chunk]
                 results = await tqdm_asyncio.gather(*tasks, desc = f"Batch {chunk_idx}", leave = False)
 
-                valid = [r for r in results if r is not None]
+                valid = [_sanitize_for_parquet(r) for r in results if r is not None]
                 if valid:
                     out_file = raw_path / f"metadata_part_{next_part_idx:04d}.parquet"
                     pd.DataFrame(valid).to_parquet(out_file, compression = 'zstd', index = False)
