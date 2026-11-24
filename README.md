@@ -18,3 +18,6 @@ git clone https://github.com/jaeahcodes/deadlock-win-predictor
 cd deadlock-win-predictor
 # Install dependencies
 ``` 
+
+To extract Deadlock match metadata, clone the Github repository and run: 
+```python3 scripts/data_extraction/cli.py```
