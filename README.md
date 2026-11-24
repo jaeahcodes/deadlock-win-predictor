@@ -1,4 +1,4 @@
-# Deadlock Win Predictor
+# [WIP] Deadlock Win Predictor
 By Taha, Jaeah, and Carter
 
 This project builds a live-win predictor tool for Deadlock matches that estimates win probabilities as games unfold using player-level telemetry data across 180-second match intervals.  
